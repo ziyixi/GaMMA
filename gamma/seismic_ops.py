@@ -117,10 +117,10 @@ def _interp(time_table, r, z, rgrid, zgrid, h):
 
 
 def traveltime(event_loc, station_loc, time_table, rgrid, zgrid, h, **kwargs):
-    r = torch.sqrt(torch.sum((event_loc[:, :2] - station_loc[:, :2]) ** 2, dim=-1, keepdims=True))
-    z = event_loc[:, 2:] - station_loc[:, 2:]
-    if (event_loc[:, 2:] < 0).any():
-        print(f"Warning: depth is defined as positive down: {event_loc[:, 2:].detach().numpy()}")
+    r = torch.sqrt(torch.sum((event_loc[..., :2] - station_loc[:, :2]) ** 2, dim=-1, keepdims=True))
+    z = event_loc[..., 2:] - station_loc[:, 2:]
+    if (event_loc[..., 2:] < 0).any():
+        print(f"Warning: depth is defined as positive down: {event_loc[..., 2:].detach().numpy()}")
 
     tt = _interp(time_table, r, z, rgrid, zgrid, h)
 
@@ -267,73 +267,81 @@ def eikoloc(
     device="cpu",
     add_eqt=False,
     gamma=0.1,
-    max_iter=1000,
-    convergence=1e-9,
+    max_iter=10, # use smaller max_iter and convergence to speed up
+    convergence=1e-2,
 ):
-    event_loc = torch.tensor(event_loc0, dtype=torch.float32, requires_grad=True, device=device)
-    if bounds is not None:
-        bounds = torch.tensor(bounds, dtype=torch.float32, device=device)
-    p_index = torch.arange(len(phase_type), device=device)[phase_type == "p"]
-    s_index = torch.arange(len(phase_type), device=device)[phase_type == "s"]
-    time = torch.tensor(phase_time, dtype=torch.float32, device=device)
-    loc = torch.tensor(station_loc, dtype=torch.float32, device=device)
-    weight = torch.tensor(weight, dtype=torch.float32, device=device)
+    # np.asarray part might be redundant, remove in the future
+    event_loc0 = np.asarray(event_loc0, dtype=np.float32)
+    bounds = np.asarray(bounds, dtype=np.float32)
+
+    p_index = np.where(phase_type == "p")[0]
+    s_index = np.where(phase_type == "s")[0]
+
+    time = np.asarray(phase_time, dtype=np.float32)
+    loc = np.asarray(station_loc, dtype=np.float32)
+    weight = np.asarray(weight, dtype=np.float32)
+
     obs_p = time[p_index]
     obs_s = time[s_index]
     loc_p = loc[p_index]
     loc_s = loc[s_index]
     weight_p = weight[p_index]
     weight_s = weight[s_index]
+    
+    # here previously we have a potential bug, weight are actually contribution (possibility) of each phase, when log_possibility is too small, weight is set to 0, and final loss considering having multply all 0 weight will be 0, which is not correct. Note here the weight does not have to sum to 1, it is just a relative value.
+    if np.sum(weight_p)<1e-6:
+        weight_p = np.ones_like(weight_p)
+    if np.sum(weight_s)<1e-6:
+        weight_s = np.ones_like(weight_s)
 
-    # %% optimization
-    optimizer = torch.optim.LBFGS(params=[event_loc], max_iter=max_iter, line_search_fn="strong_wolfe", tolerance_change=convergence)
+    def loss_function(event_loc_numpy):
+        # here we still use torch so not to change the code too much
+        event_loc = torch.tensor(event_loc_numpy, dtype=torch.float32, requires_grad=True, device=device)
 
-    def closure():
-        optimizer.zero_grad()
-        if bounds is not None:
-            loc0_ = torch.max(torch.min(event_loc[:, :-1], bounds[:, 1]), bounds[:, 0])
-        else:
-            loc0_ = event_loc[:, :-1]
-        loc0_ = torch.nan_to_num(loc0_, nan=0)
-        t0_ = event_loc[:, -1:]
+        loc0_ = event_loc[:-1]
+        t0_ = event_loc[-1:]
+        loss_p, loss_s = 0, 0
+
         if len(p_index) > 0:
             tt_p = traveltime(loc0_, loc_p, up, rgrid, zgrid, h, sigma=1)
             pred_p = t0_ + tt_p
-            loss_p = torch.mean(F.huber_loss(obs_p, pred_p, reduction="none") * weight_p)
+            loss_p = torch.mean(F.huber_loss(torch.from_numpy(obs_p), pred_p, reduction="none") * torch.from_numpy(weight_p))
             if add_eqt:
                 dd_tt_p = tt_p.unsqueeze(-1) - tt_p.unsqueeze(-2)
                 dd_time_p = obs_p.unsqueeze(-1) - obs_p.unsqueeze(-2)
                 loss_p += gamma * torch.mean(
                     F.huber_loss(dd_tt_p, dd_time_p, reduction="none") * weight_p.unsqueeze(-1) * weight_p.unsqueeze(-2)
                 )
-            # loss_p = F.mse_loss(time_p, tt_p)
-        else:
-            loss_p = 0
+
         if len(s_index) > 0:
             tt_s = traveltime(loc0_, loc_s, us, rgrid, zgrid, h, sigma=1)
             pred_s = t0_ + tt_s
-            loss_s = torch.mean(F.huber_loss(obs_s, pred_s, reduction="none") * weight_s)
+            loss_s = torch.mean(F.huber_loss(torch.from_numpy(obs_s), pred_s, reduction="none") * torch.from_numpy(weight_s))
             if add_eqt:
                 dd_tt_s = tt_s.unsqueeze(-1) - tt_s.unsqueeze(-2)
                 dd_time_s = obs_s.unsqueeze(-1) - obs_s.unsqueeze(-2)
                 loss_s += gamma * torch.mean(
                     F.huber_loss(dd_tt_s, dd_time_s, reduction="none") * weight_s.unsqueeze(-1) * weight_s.unsqueeze(-2)
                 )
-            # loss_s = F.mse_loss(time_s, tt_s)
-        else:
-            loss_s = 0
+
         loss = loss_p + loss_s
-        loss.backward()
-        return loss
+        return loss.item()
 
-    optimizer.step(closure)
-    loss = closure().item()
+    # when we enter this function, the time constrain has already be removed as it's None (see bounds parameter in eikoloc function). So here we just need to add the time constrain back.
+    bounds=np.vstack((bounds, np.array([-1e9,1e9], dtype=np.float32)))
+    result=scipy.optimize.differential_evolution(
+        func=loss_function,
+        bounds=bounds,
+        maxiter=max_iter,
+        tol=convergence,
+        disp=False,
+        popsize=5,
+    )
 
-    event_loc = event_loc.detach().cpu()
-    if bounds is not None:
-        event_loc[:, :-1] = torch.max(torch.min(event_loc[:, :-1], bounds[:, 1]), bounds[:, 0])
+    event_loc_opt = result.x
+    loss = result.fun
 
-    return event_loc, loss
+    return event_loc_opt, loss
 
 
 def calc_loc(
@@ -388,7 +396,8 @@ def initialize_eikonal(config):
     h = config["h"]
     
     f = '_'.join([str(x) for x in [int(rlim[0]), int(rlim[1]), int(zlim[0]), int(zlim[1]), config['h']]])
-    if (path / (f+'.dir')).is_file():
+    # shelve will create a file with suffix .db no matter what the input file name is
+    if (path / (f+'.db')).is_file():
         with shelve.open(str(path / f)) as e:
             up = e['up']
             us = e['us']

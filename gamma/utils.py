@@ -81,6 +81,7 @@ def association(picks, stations, config, event_idx0=0, method="BGMM", **kwargs):
         print(f"Associating {len(data)} picks with {config['ncpu']} CPUs")
         events, assignment = associate(
             list(unique_labels)[0],
+            labels,
             data,
             locs,
             phase_type,
@@ -186,6 +187,13 @@ def associate(
         covariance_prior = np.array([[covariance_prior_pre[0]]])
         data_ = data_[:, 0:1]
 
+    # when using eikonal, the tol should be larger, the max_iter should be smaller
+    if config["eikonal"] is not None:
+        tol = 0.1
+        max_iter = 10
+    else:
+        tol = 1e-3
+        max_iter = 100
     if method == "BGMM":
         gmm = BayesianGaussianMixture(
             n_components=len(centers_init),
@@ -200,6 +208,8 @@ def associate(
             vel=vel,
             eikonal=config["eikonal"],
             bounds=config["bfgs_bounds"],
+            tol=tol,
+            max_iter=max_iter,
         ).fit(data_)
     elif method == "GMM":
         gmm = GaussianMixture(
@@ -215,6 +225,8 @@ def associate(
             dummy_comp=True,
             dummy_prob=1 / (1 * np.sqrt(2 * np.pi)) * np.exp(-1 / 2),
             dummy_quantile=0.1,
+            tol=tol,
+            max_iter=max_iter,
         ).fit(data_)
     else:
         raise (f"Unknown method {method}; Should be 'BGMM' or 'GMM'")
