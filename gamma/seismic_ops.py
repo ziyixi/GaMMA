@@ -3,12 +3,6 @@ import numpy as np
 import scipy.optimize
 import shelve
 from pathlib import Path
-try:
-    import torch
-    import torch.nn.functional as F
-    import torch.optim
-except:
-    pass
 
 
 ###################################### Eikonal Solver ######################################
@@ -85,8 +79,8 @@ def eikonal_solve(u, f, h):
 
 
 def _interp(time_table, r, z, rgrid, zgrid, h):
-    ir0 = (r - rgrid[0, 0]).div(h, rounding_mode='floor').clamp(0, rgrid.shape[0] - 2).long()
-    iz0 = (z - zgrid[0, 0]).div(h, rounding_mode='floor').clamp(0, zgrid.shape[1] - 2).long()
+    ir0 = np.floor((r - rgrid[0, 0]) / h).clip(0, rgrid.shape[0] - 2).astype(int)
+    iz0 = np.floor((z - zgrid[0, 0]) / h).clip(0, zgrid.shape[1] - 2).astype(int)
     ir1 = ir0 + 1
     iz1 = iz0 + 1
 
@@ -117,10 +111,10 @@ def _interp(time_table, r, z, rgrid, zgrid, h):
 
 
 def traveltime(event_loc, station_loc, time_table, rgrid, zgrid, h, **kwargs):
-    r = torch.sqrt(torch.sum((event_loc[..., :2] - station_loc[:, :2]) ** 2, dim=-1, keepdims=True))
+    r = np.sqrt(np.sum((event_loc[..., :2] - station_loc[:, :2]) ** 2, axis=-1, keepdims=True))
     z = event_loc[..., 2:] - station_loc[:, 2:]
     if (event_loc[..., 2:] < 0).any():
-        print(f"Warning: depth is defined as positive down: {event_loc[..., 2:].detach().numpy()}")
+        print(f"Warning: depth is defined as positive down: {event_loc[..., 2:]}")
 
     tt = _interp(time_table, r, z, rgrid, zgrid, h)
 
@@ -139,12 +133,10 @@ def calc_time(event_loc, station_loc, phase_type, vel={"p": 6.0, "s": 6.0 / 1.75
         v = np.array([vel[x] for x in phase_type])[:, np.newaxis]
         tt = np.linalg.norm(ev_loc - station_loc, axis=-1, keepdims=True) / v + ev_t
     else:
-        ev_loc = torch.from_numpy(ev_loc).float()
-        station_locs = torch.from_numpy(station_loc).float()
 
         tp = traveltime(
             ev_loc,
-            station_locs[phase_type == "p"],
+            station_loc[phase_type == "p"],
             eikonal["up"],
             eikonal["rgrid"],
             eikonal["zgrid"],
@@ -153,7 +145,7 @@ def calc_time(event_loc, station_loc, phase_type, vel={"p": 6.0, "s": 6.0 / 1.75
         )
         ts = traveltime(
             ev_loc,
-            station_locs[phase_type == "s"],
+            station_loc[phase_type == "s"],
             eikonal["us"],
             eikonal["rgrid"],
             eikonal["zgrid"],
@@ -161,9 +153,9 @@ def calc_time(event_loc, station_loc, phase_type, vel={"p": 6.0, "s": 6.0 / 1.75
             **kwargs,
         )
 
-        tt = np.zeros(len(phase_type), dtype=np.float32)[:, np.newaxis]
-        tt[phase_type == "p"] = tp.numpy()
-        tt[phase_type == "s"] = ts.numpy()
+        tt = np.zeros(len(phase_type), dtype=np.float64)[:, np.newaxis]
+        tt[phase_type == "p"] = tp
+        tt[phase_type == "s"] = ts
         tt = tt + ev_t
 
     return tt
@@ -251,6 +243,14 @@ def linloc(
 
     return opt.x[np.newaxis, :], opt.fun
 
+def huber_loss(y_true, y_pred, delta=1.0):
+    residual = y_true - y_pred
+    abs_residual = np.abs(residual)
+    
+    loss = np.where(abs_residual <= delta, 0.5 * residual**2, delta * (abs_residual - 0.5 * delta))
+    
+    return loss
+
 
 def eikoloc(
     event_loc0,
@@ -271,15 +271,9 @@ def eikoloc(
     convergence=1e-2,
 ):
     # np.asarray part might be redundant, remove in the future
-    event_loc0 = np.asarray(event_loc0, dtype=np.float32)
-    bounds = np.asarray(bounds, dtype=np.float32)
-
     p_index = np.where(phase_type == "p")[0]
     s_index = np.where(phase_type == "s")[0]
 
-    time = np.asarray(phase_time, dtype=np.float32)
-    loc = np.asarray(station_loc, dtype=np.float32)
-    weight = np.asarray(weight, dtype=np.float32)
 
     obs_p = time[p_index]
     obs_s = time[s_index]
@@ -295,41 +289,27 @@ def eikoloc(
         weight_s = np.ones_like(weight_s)
 
     def loss_function(event_loc_numpy):
-        # here we still use torch so not to change the code too much
-        event_loc = torch.tensor(event_loc_numpy, dtype=torch.float32, requires_grad=False, device=device)
-
+        event_loc = event_loc_numpy.copy()
         loc0_ = event_loc[:-1]
         t0_ = event_loc[-1:]
         loss_p, loss_s = 0, 0
+        delta = 1
 
         if len(p_index) > 0:
-            tt_p = traveltime(loc0_, loc_p, up, rgrid, zgrid, h, sigma=1)
+            tt_p = traveltime(loc0_, loc_p, up, rgrid, zgrid, h)
             pred_p = t0_ + tt_p
-            loss_p = torch.mean(F.huber_loss(torch.from_numpy(obs_p), pred_p, reduction="none") * torch.from_numpy(weight_p))
-            if add_eqt:
-                dd_tt_p = tt_p.unsqueeze(-1) - tt_p.unsqueeze(-2)
-                dd_time_p = obs_p.unsqueeze(-1) - obs_p.unsqueeze(-2)
-                loss_p += gamma * torch.mean(
-                    F.huber_loss(dd_tt_p, dd_time_p, reduction="none") * weight_p.unsqueeze(-1) * weight_p.unsqueeze(-2)
-                )
+            loss_p = np.mean(huber_loss(obs_p, pred_p, delta=delta) * weight_p)
 
         if len(s_index) > 0:
-            tt_s = traveltime(loc0_, loc_s, us, rgrid, zgrid, h, sigma=1)
+            tt_s = traveltime(loc0_, loc_s, us, rgrid, zgrid, h)
             pred_s = t0_ + tt_s
-            loss_s = torch.mean(F.huber_loss(torch.from_numpy(obs_s), pred_s, reduction="none") * torch.from_numpy(weight_s))
-            if add_eqt:
-                dd_tt_s = tt_s.unsqueeze(-1) - tt_s.unsqueeze(-2)
-                dd_time_s = obs_s.unsqueeze(-1) - obs_s.unsqueeze(-2)
-                loss_s += gamma * torch.mean(
-                    F.huber_loss(dd_tt_s, dd_time_s, reduction="none") * weight_s.unsqueeze(-1) * weight_s.unsqueeze(-2)
-                )
+            loss_s = np.mean(huber_loss(obs_s, pred_s, delta=delta) * weight_s)
 
         loss = loss_p + loss_s
-        return loss.item()
+        return loss
 
-    # when we enter this function, the time constrain has already be removed as it's None (see bounds parameter in eikoloc function). So here we just need to add the time constrain back.
-    bounds=np.vstack((bounds, np.array([-1e9,1e9], dtype=np.float32)))
-    result=scipy.optimize.differential_evolution(
+    bounds = np.vstack((bounds, np.array([-1e9, 1e9])))
+    result = scipy.optimize.differential_evolution(
         func=loss_function,
         bounds=bounds,
         maxiter=max_iter,
@@ -425,11 +405,7 @@ def initialize_eikonal(config):
         us[edge_grids, edge_grids] = 0.0
         us = eikonal_solve(us, vs, h)
 
-        up = torch.tensor(up, dtype=torch.float32)
-        us = torch.tensor(us, dtype=torch.float32)
-        rgrid = torch.tensor(rgrid, dtype=torch.float32)
-        zgrid = torch.tensor(zgrid, dtype=torch.float32)
-        rgrid, zgrid = torch.meshgrid(rgrid, zgrid, indexing="ij")
+        rgrid, zgrid = np.meshgrid(rgrid, zgrid, indexing="ij")
         with shelve.open(str(path / f)) as e:
             e['up'] = up
             e['us'] = us
