@@ -296,7 +296,7 @@ def eikoloc(
 
     def loss_function(event_loc_numpy):
         # here we still use torch so not to change the code too much
-        event_loc = torch.tensor(event_loc_numpy, dtype=torch.float32, requires_grad=True, device=device)
+        event_loc = torch.tensor(event_loc_numpy, dtype=torch.float32, requires_grad=False, device=device)
 
         loc0_ = event_loc[:-1]
         t0_ = event_loc[-1:]
