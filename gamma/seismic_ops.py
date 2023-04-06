@@ -275,10 +275,10 @@ def eikoloc(
     s_index = np.where(phase_type == "s")[0]
 
 
-    obs_p = time[p_index]
-    obs_s = time[s_index]
-    loc_p = loc[p_index]
-    loc_s = loc[s_index]
+    obs_p = phase_time[p_index]
+    obs_s = phase_time[s_index]
+    loc_p = station_loc[p_index]
+    loc_s = station_loc[s_index]
     weight_p = weight[p_index]
     weight_s = weight[s_index]
     
