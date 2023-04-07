@@ -324,10 +324,10 @@ def eikoloc(
     weight_s = weight[s_index]
     
     # here previously we have a potential bug, weight are actually contribution (possibility) of each phase, when log_possibility is too small, weight is set to 0, and final loss considering having multply all 0 weight will be 0, which is not correct. Note here the weight does not have to sum to 1, it is just a relative value.
-    if np.sum(weight_p)<1e-6:
-        weight_p = np.ones_like(weight_p)
-    if np.sum(weight_s)<1e-6:
-        weight_s = np.ones_like(weight_s)
+    # if np.sum(weight_p)<1e-6:
+    #     weight_p = np.ones_like(weight_p)
+    # if np.sum(weight_s)<1e-6:
+    #     weight_s = np.ones_like(weight_s)
 
     bounds = np.vstack((bounds, np.array([-1e9, 1e9])))
     result = scipy.optimize.differential_evolution(
