@@ -3,7 +3,7 @@ import numpy as np
 import scipy.optimize
 import shelve
 from pathlib import Path
-
+from numba import njit
 
 ###################################### Eikonal Solver ######################################
 # |\nabla u| = f
@@ -77,10 +77,19 @@ def eikonal_solve(u, f, h):
 
 ###################################### Traveltime based on Eikonal Timetable ######################################
 
+@njit
+def get_values_from_table(ir0, iz0, time_table):
+    res=np.zeros_like(ir0)
+    for i in range(ir0.shape[0]):
+        r = ir0[i, 0]
+        z = iz0[i, 0]
+        res[i, 0] = time_table[r, z]
+    return res
 
+@njit
 def _interp(time_table, r, z, rgrid, zgrid, h):
-    ir0 = np.floor((r - rgrid[0, 0]) / h).clip(0, rgrid.shape[0] - 2).astype(int)
-    iz0 = np.floor((z - zgrid[0, 0]) / h).clip(0, zgrid.shape[1] - 2).astype(int)
+    ir0 = np.floor((r - rgrid[0, 0]) / h).clip(0, rgrid.shape[0] - 2).astype(np.int64)
+    iz0 = np.floor((z - zgrid[0, 0]) / h).clip(0, zgrid.shape[1] - 2).astype(np.int64)
     ir1 = ir0 + 1
     iz1 = iz0 + 1
 
@@ -90,10 +99,10 @@ def _interp(time_table, r, z, rgrid, zgrid, h):
     y1 = iz0 * h + zgrid[0, 0]
     y2 = iz1 * h + zgrid[0, 0]
 
-    Q11 = time_table[ir0, iz0]
-    Q12 = time_table[ir0, iz1]
-    Q21 = time_table[ir1, iz0]
-    Q22 = time_table[ir1, iz1]
+    Q11 = get_values_from_table(ir0, iz0, time_table)
+    Q12 = get_values_from_table(ir0, iz1, time_table)
+    Q21 = get_values_from_table(ir1, iz0, time_table)
+    Q22 = get_values_from_table(ir1, iz1, time_table)
 
     t = (
         1
@@ -109,12 +118,22 @@ def _interp(time_table, r, z, rgrid, zgrid, h):
 
     return t
 
+@njit
+def traveltime(event_loc, station_loc, time_table, rgrid, zgrid, h):
+    num_stations = station_loc.shape[0]
+    
+    if event_loc.ndim == 1:
+        event_loc_expanded = event_loc.reshape(1, -1)
+    else:
+        event_loc_expanded = event_loc
 
-def traveltime(event_loc, station_loc, time_table, rgrid, zgrid, h, **kwargs):
-    r = np.sqrt(np.sum((event_loc[..., :2] - station_loc[:, :2]) ** 2, axis=-1, keepdims=True))
-    z = event_loc[..., 2:] - station_loc[:, 2:]
-    if (event_loc[..., 2:] < 0).any():
-        print(f"Warning: depth is defined as positive down: {event_loc[..., 2:]}")
+    r = np.empty((num_stations, 1))
+    z = np.empty((num_stations, 1))
+
+    for i in range(num_stations):
+        diff = event_loc_expanded[0, :2] - station_loc[i, :2]
+        r[i, 0] = np.sqrt(np.sum(diff ** 2))
+        z[i, 0] = event_loc_expanded[0, 2] - station_loc[i, 2]
 
     tt = _interp(time_table, r, z, rgrid, zgrid, h)
 
@@ -243,12 +262,34 @@ def linloc(
 
     return opt.x[np.newaxis, :], opt.fun
 
+@njit
 def huber_loss(y_true, y_pred, delta=1.0):
     residual = y_true - y_pred
     abs_residual = np.abs(residual)
     
     loss = np.where(abs_residual <= delta, 0.5 * residual**2, delta * (abs_residual - 0.5 * delta))
     
+    return loss
+
+@njit
+def loss_function_eikoloc(event_loc_numpy, loc_p, loc_s, up, us, rgrid, zgrid, h, obs_p, obs_s, weight_p, weight_s, p_index, s_index):
+    event_loc = event_loc_numpy.copy()
+    loc0_ = event_loc[:-1]
+    t0_ = event_loc[-1:]
+    loss_p, loss_s = 0, 0
+    delta = 1
+
+    if len(p_index) > 0:
+        tt_p = traveltime(loc0_, loc_p, up, rgrid, zgrid, h)
+        pred_p = t0_ + tt_p
+        loss_p = np.mean(huber_loss(obs_p, pred_p, delta=delta) * weight_p)
+
+    if len(s_index) > 0:
+        tt_s = traveltime(loc0_, loc_s, us, rgrid, zgrid, h)
+        pred_s = t0_ + tt_s
+        loss_s = np.mean(huber_loss(obs_s, pred_s, delta=delta) * weight_s)
+
+    loss = loss_p + loss_s
     return loss
 
 
@@ -267,7 +308,7 @@ def eikoloc(
     device="cpu",
     add_eqt=False,
     gamma=0.1,
-    max_iter=10, # use smaller max_iter and convergence to speed up
+    max_iter=100, 
     convergence=1e-2,
 ):
     # np.asarray part might be redundant, remove in the future
@@ -288,34 +329,14 @@ def eikoloc(
     if np.sum(weight_s)<1e-6:
         weight_s = np.ones_like(weight_s)
 
-    def loss_function(event_loc_numpy):
-        event_loc = event_loc_numpy.copy()
-        loc0_ = event_loc[:-1]
-        t0_ = event_loc[-1:]
-        loss_p, loss_s = 0, 0
-        delta = 1
-
-        if len(p_index) > 0:
-            tt_p = traveltime(loc0_, loc_p, up, rgrid, zgrid, h)
-            pred_p = t0_ + tt_p
-            loss_p = np.mean(huber_loss(obs_p, pred_p, delta=delta) * weight_p)
-
-        if len(s_index) > 0:
-            tt_s = traveltime(loc0_, loc_s, us, rgrid, zgrid, h)
-            pred_s = t0_ + tt_s
-            loss_s = np.mean(huber_loss(obs_s, pred_s, delta=delta) * weight_s)
-
-        loss = loss_p + loss_s
-        return loss
-
     bounds = np.vstack((bounds, np.array([-1e9, 1e9])))
     result = scipy.optimize.differential_evolution(
-        func=loss_function,
+        func=lambda x: loss_function_eikoloc(x, loc_p, loc_s, up, us, rgrid, zgrid, h, obs_p, obs_s, weight_p, weight_s, p_index, s_index),
         bounds=bounds,
         maxiter=max_iter,
         tol=convergence,
         disp=False,
-        popsize=5,
+        popsize=10,
     )
 
     event_loc_opt = result.x
