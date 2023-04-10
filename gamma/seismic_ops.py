@@ -397,8 +397,8 @@ def initialize_eikonal(config):
     h = config["h"]
     
     f = '_'.join([str(x) for x in [int(rlim[0]), int(rlim[1]), int(zlim[0]), int(zlim[1]), config['h']]])
-    # shelve will create a file with suffix .db no matter what the input file name is
-    if (path / (f+'.db')).is_file():
+
+    if (path / (f+'.db')).is_file() or (path / (f+'.dir')).is_file():
         with shelve.open(str(path / f)) as e:
             up = e['up']
             us = e['us']
